@@ -1,0 +1,244 @@
+import os
+import glob
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy.interpolate import UnivariateSpline
+import matplotlib.pyplot as plt
+import datetime
+from tqdm import tqdm  # Для прогресс-бара (pip install tqdm)
+
+# ==========================================
+# 1. НАСТРОЙКИ
+# ==========================================
+CONFIG = {
+    'data_folder': '.',           # Путь к папке с .parquet файлами (точка = текущая папка)
+    'file_pattern': '*.parquet',  # Шаблон поиска файлов
+    'smoothing_factor': 0.05,     # Сила сглаживания
+    'risk_free_rate': 0.0,
+    'min_time_to_expiry': 0.005,  # Игнорируем опционы, которым жить меньше 2 дней
+}
+
+# ==========================================
+# 2. МАТЕМАТИЧЕСКОЕ ЯДРО (Reused)
+# ==========================================
+class BlackScholes:
+    @staticmethod
+    def price(S, K, T, r, sigma, type_='C'):
+        if T <= 0 or sigma <= 0: return 0.0
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        if type_ == 'C':
+            return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        else:
+            return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+    @staticmethod
+    def implied_volatility(price, S, K, T, r, type_='C'):
+        intrinsic = max(0, S - K) if type_ == 'C' else max(0, K - S)
+        if price <= intrinsic + 1e-6: return np.nan
+        def objective(sigma):
+            return BlackScholes.price(S, K, T, r, sigma, type_) - price
+        try:
+            return brentq(objective, 0.01, 5.0)
+        except:
+            return np.nan
+
+# ==========================================
+# 3. ДВИЖОК БЭКТЕСТА
+# ==========================================
+class Backtester:
+    def __init__(self, config):
+        self.config = config
+        self.results = [] # Сюда будем писать статистику по дням
+
+    def get_file_list(self):
+        # Ищем все файлы и сортируем их по имени (по дате)
+        path = os.path.join(self.config['data_folder'], self.config['file_pattern'])
+        files = glob.glob(path)
+        files.sort()
+        print(f"Найдено файлов для анализа: {len(files)}")
+        if len(files) == 0:
+            raise FileNotFoundError("Файлы не найдены! Проверь путь в CONFIG.")
+        return files
+
+    def process_day(self, file_path):
+        """Обрабатывает ОДИН файл (один день)"""
+        try:
+            df = pd.read_parquet(file_path)
+            
+            # Берем последний доступный срез (конец дня)
+            timestamp = df['exchange_ts'].max()
+            df_snap = df[df['exchange_ts'] == timestamp].copy()
+            
+            # 1. Поиск Спота
+            spot_row = df_snap[df_snap['instrument_type'] == 0]
+            if not spot_row.empty:
+                S = (spot_row['best_bid_price'].iloc[0] + spot_row['best_ask_price'].iloc[0]) / 2
+            else:
+                # Если спота нет, пропускаем файл (нельзя построить модель)
+                return None
+
+            # 2. Подготовка опционов
+            opts = df_snap[df_snap['instrument_type'] == 3].copy()
+            ns_in_year = 1e9 * 365 * 24 * 3600
+            opts['T'] = (opts['maturity'] - timestamp) / ns_in_year
+            opts = opts[opts['T'] > self.config['min_time_to_expiry']]
+            
+            if len(opts) < 10: return None # Слишком мало данных
+
+            opts['type'] = opts['instrument_id'].apply(lambda x: 'P' if '-P' in str(x) else 'C')
+            mid_btc = (opts['best_bid_price'] + opts['best_ask_price']) / 2
+            opts['price_usd'] = mid_btc * S
+            opts['weight'] = 1.0 / ((opts['best_ask_price'] - opts['best_bid_price']) + 1e-9)
+
+            # 3. Расчет Raw IV
+            opts['raw_iv'] = opts.apply(lambda row: BlackScholes.implied_volatility(
+                row['price_usd'], S, row['strike'], row['T'], self.config['risk_free_rate'], row['type']
+            ), axis=1)
+            opts = opts.dropna(subset=['raw_iv'])
+
+            # 4. ФИТИНГ МОДЕЛИ (для самой популярной экспирации)
+            # Берем экспирацию, где больше всего страйков
+            target_maturity = opts['maturity'].mode()[0]
+            subset = opts[opts['maturity'] == target_maturity].sort_values('strike').copy()
+            
+            if len(subset) < 5: return None
+
+            T = subset['T'].iloc[0]
+            F = S # Assuming r=0
+            
+            # Координаты для сплайна
+            subset['log_mn'] = np.log(subset['strike'] / F)
+            subset['total_var'] = (subset['raw_iv']**2) * T
+            
+            # Строим сплайн
+            model = UnivariateSpline(
+                subset['log_mn'], subset['total_var'], w=subset['weight'], 
+                s=self.config['smoothing_factor'], k=3
+            )
+
+            # 5. ОЦЕНКА КАЧЕСТВА (Metrics)
+            errors = []
+            
+            # Считаем ошибку модели на реальных данных
+            for idx, row in subset.iterrows():
+                # Модель предсказывает волатильность
+                pred_var = model(np.log(row['strike']/F))
+                pred_sigma = np.sqrt(max(1e-6, pred_var) / T)
+                
+                # Модель предсказывает цену
+                pred_price = BlackScholes.price(S, row['strike'], T, 0, pred_sigma, row['type'])
+                errors.append(pred_price - row['price_usd'])
+
+            errors = np.array(errors)
+            rmse = np.sqrt(np.mean(errors**2)) # Ошибка в долларах
+            
+            # Проверка на арбитраж (Butterfly)
+            # Берем сетку страйков и считаем PDF
+            k_grid = np.linspace(S*0.8, S*1.2, 50)
+            p_grid = []
+            for k in k_grid:
+                v_var = model(np.log(k/F))
+                v_sig = np.sqrt(max(1e-6, v_var)/T)
+                p_grid.append(BlackScholes.price(S, k, T, 0, v_sig, 'C'))
+            
+            pdf = np.gradient(np.gradient(p_grid))
+            arb_flag = 1 if np.min(pdf) < -1e-6 else 0
+            
+            # ATM Volatility (для графика истории)
+            atm_vol = np.sqrt(max(1e-6, model(0)) / T)
+
+            return {
+                'date': datetime.datetime.fromtimestamp(timestamp / 1e9),
+                'spot': S,
+                'rmse': rmse,
+                'arbitrage': arb_flag,
+                'atm_vol': atm_vol,
+                'contracts_count': len(subset)
+            }
+
+        except Exception as e:
+            # Если файл битый, возвращаем None, но печатаем ошибку
+            # print(f"Error processing {file_path}: {e}")
+            return None
+
+    def run(self):
+        files = self.get_file_list()
+        
+        print("Запуск симуляции рынка...")
+        # tqdm создает полоску прогресса
+        for f in tqdm(files):
+            res = self.process_day(f)
+            if res:
+                self.results.append(res)
+        
+        # Конвертируем результаты в DataFrame
+        df_res = pd.DataFrame(self.results)
+        df_res.set_index('date', inplace=True)
+        return df_res
+
+# ==========================================
+# 4. ВИЗУАЛИЗАЦИЯ
+# ==========================================
+def plot_results(df):
+    if df.empty:
+        print("Нет результатов для отображения.")
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    # График 1: Цена Биткоина и Волатильность
+    ax1 = axes[0]
+    color = 'tab:red'
+    ax1.set_ylabel('Bitcoin Price ($)', color=color)
+    ax1.plot(df.index, df['spot'], color=color, label='BTC Spot')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_title('Рыночная динамика: Цена vs Страх (IV)')
+    ax1.grid(True, alpha=0.3)
+
+    ax1_b = ax1.twinx()
+    color = 'tab:blue'
+    ax1_b.set_ylabel('ATM Volatility', color=color)
+    ax1_b.plot(df.index, df['atm_vol'], color=color, label='ATM Vol')
+    ax1_b.tick_params(axis='y', labelcolor=color)
+
+    # График 2: Ошибка модели (RMSE)
+    ax2 = axes[1]
+    ax2.plot(df.index, df['rmse'], color='green', label='Model Error (USD)')
+    ax2.set_ylabel('Pricing Error ($)')
+    ax2.set_title('Точность модели (RMSE)')
+    ax2.fill_between(df.index, df['rmse'], alpha=0.2, color='green')
+    ax2.grid(True)
+    
+    # Добавим линию "приемлемой ошибки" (например $50)
+    ax2.axhline(50, color='red', linestyle='--', label='Threshold ($50)')
+    ax2.legend()
+
+    # График 3: Стабильность (Арбитраж)
+    ax3 = axes[2]
+    ax3.bar(df.index, df['arbitrage'], color='orange', width=1.0)
+    ax3.set_ylabel('Arbitrage Detected (1/0)')
+    ax3.set_title('Стабильность модели (Дни с арбитражем)')
+    ax3.set_ylim(0, 1.1)
+    
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================
+# ЗАПУСК
+# ==========================================
+if __name__ == "__main__":
+    # Убедись, что файлы лежат рядом или укажи путь
+    tester = Backtester(CONFIG)
+    
+    try:
+        results_df = tester.run()
+        print("\n=== РЕЗУЛЬТАТЫ БЭКТЕСТА ===")
+        print(results_df.describe())
+        
+        plot_results(results_df)
+        
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
